@@ -1,0 +1,251 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// This security rules file assumes the following data structures:
+//
+// Collection: users
+// Document ID: {userId} (Must match request.auth.uid)
+// Fields:
+//   - uid: string (optional, must match {userId})
+//   - email: string (optional, valid email format, max 320 chars)
+//   - displayName: string (optional, 1..100 chars)
+//   - photoURL: string (optional, valid URL, max 2048 chars)
+//   - createdAt: timestamp (optional, immutable once written)
+//   - updatedAt: timestamp (optional)
+//
+// Subcollection: users/{userId}/words
+// Document ID: {wordId} (Document ID for vocabulary item)
+// Fields:
+//   - word: string (required, 1..150 chars) - The English word/phrase
+//   - meaning: string (optional, 1..2000 chars) - Korean/native meaning or definition
+//   - definition: string (optional, 1..2000 chars) - Alternative definition field
+//   - partOfSpeech: string (optional, 1..50 chars) - e.g. noun, verb, adjective
+//   - pronunciation: string (optional, 0..150 chars) - IPA phonetic transcription
+//   - phonetic: string (optional, 0..150 chars) - Alternative phonetic field
+//   - example: string (optional, 0..2000 chars) - Example sentence
+//   - exampleSentence: string (optional, 0..2000 chars) - Alternative example field
+//   - exampleMeaning: string (optional, 0..2000 chars) - Example sentence translation
+//   - exampleTranslation: string (optional, 0..2000 chars) - Alternative translation field
+//   - notes: string (optional, 0..3000 chars) - Personal study notes or mnemonics
+//   - memo: string (optional, 0..3000 chars) - Alternative memo field
+//   - tags: list of strings (optional, max 20 items) - Categories/tags
+//   - isMemorized: bool (optional) - Learned/mastered toggle
+//   - memorized: bool (optional) - Alternative memorized boolean field
+//   - difficulty: int (1..5) or string (max 20 chars) - Difficulty rating
+//   - level: int (1..10) or string (max 20 chars) - Level indicator
+//   - reviewCount: int (optional, >= 0) - Number of review attempts
+//   - memoryStage: int (optional, 0..20) - Spaced repetition stage
+//   - lastReviewedAt: timestamp (optional) - Last review timestamp
+//   - nextReviewDate: timestamp (optional) - Scheduled next review date
+//   - createdAt: timestamp (optional, immutable once written)
+//   - updatedAt: timestamp (optional)
+//   - userId: string (optional, must match {userId}, immutable once written)
+//
+// Any Other Subcollections: users/{userId}/{subcollection}/{docId}
+//   - Strictly locked to the authenticated owner (request.auth.uid == userId)
+//   - Size and field bounds enforced to prevent DoS/storage abuse
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // -------------------------------------------------------------
+    // Helper Functions
+    // -------------------------------------------------------------
+
+    // Check if the request is from an authenticated user
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Check if the authenticated user owns the resource path
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Check if user is owner based on document's uid or userId field
+    function isDocOwner() {
+      return isAuthenticated() &&
+        (('uid' in resource.data && request.auth.uid == resource.data.uid) ||
+         ('userId' in resource.data && request.auth.uid == resource.data.userId));
+    }
+
+    // Verify UID hasn't been tampered with on create
+    function uidUnchanged() {
+      return (!('uid' in request.resource.data) || request.resource.data.uid == request.auth.uid) &&
+             (!('userId' in request.resource.data) || request.resource.data.userId == request.auth.uid);
+    }
+
+    // Ensure UID field is not modified on update
+    function uidNotModified() {
+      return (!('uid' in request.resource.data) || request.resource.data.uid == resource.data.uid) &&
+             (!('userId' in request.resource.data) || request.resource.data.userId == resource.data.userId);
+    }
+
+    // Validate required fields exist in request data
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    // Validate that document contains only allowed fields (Strict Schema)
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    // Ensure specific immutable fields are not modified or deleted on update
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    // Validate email format
+    function isValidEmail(email) {
+      return email is string &&
+             email.size() <= 320 &&
+             email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    // Validate URL format (http:// or https://)
+    function isValidUrl(url) {
+      return url is string &&
+             url.size() <= 2048 &&
+             (url.matches("^https://.*") || url.matches("^http://.*"));
+    }
+
+    // -------------------------------------------------------------
+    // Domain Validators
+    // -------------------------------------------------------------
+
+    // Validate user profile document schema & constraints
+    function isValidUser(data, userId) {
+      return hasOnlyAllowedFields(['uid', 'email', 'displayName', 'photoURL', 'createdAt', 'updatedAt']) &&
+             (!('uid' in data) || (data.uid is string && data.uid == userId)) &&
+             (!('email' in data) || isValidEmail(data.email)) &&
+             (!('displayName' in data) || (data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 100)) &&
+             (!('photoURL' in data) || isValidUrl(data.photoURL)) &&
+             (!('createdAt' in data) || data.createdAt is timestamp) &&
+             (!('updatedAt' in data) || data.updatedAt is timestamp);
+    }
+
+    // Immutable field protection for user profile
+    function areImmutableUserFieldsUnchanged() {
+      return areImmutableFieldsUnchanged(['createdAt', 'uid']);
+    }
+
+    // Validate vocabulary word document schema & constraints
+    function isValidWord(data, userId) {
+      return hasOnlyAllowedFields([
+               'word',
+               'meaning',
+               'definition',
+               'partOfSpeech',
+               'pronunciation',
+               'phonetic',
+               'example',
+               'exampleSentence',
+               'exampleMeaning',
+               'exampleTranslation',
+               'notes',
+               'memo',
+               'tags',
+               'isMemorized',
+               'memorized',
+               'difficulty',
+               'level',
+               'reviewCount',
+               'memoryStage',
+               'lastReviewedAt',
+               'nextReviewDate',
+               'createdAt',
+               'updatedAt',
+               'userId'
+             ]) &&
+             // Required core field: word
+             ('word' in data && data.word is string && data.word.size() >= 1 && data.word.size() <= 150) &&
+             // Optional string fields with strict length constraints (prevent DoS / 1MB injection)
+             (!('meaning' in data) || (data.meaning is string && data.meaning.size() >= 1 && data.meaning.size() <= 2000)) &&
+             (!('definition' in data) || (data.definition is string && data.definition.size() >= 1 && data.definition.size() <= 2000)) &&
+             (!('partOfSpeech' in data) || (data.partOfSpeech is string && data.partOfSpeech.size() <= 50)) &&
+             (!('pronunciation' in data) || (data.pronunciation is string && data.pronunciation.size() <= 150)) &&
+             (!('phonetic' in data) || (data.phonetic is string && data.phonetic.size() <= 150)) &&
+             (!('example' in data) || (data.example is string && data.example.size() <= 2000)) &&
+             (!('exampleSentence' in data) || (data.exampleSentence is string && data.exampleSentence.size() <= 2000)) &&
+             (!('exampleMeaning' in data) || (data.exampleMeaning is string && data.exampleMeaning.size() <= 2000)) &&
+             (!('exampleTranslation' in data) || (data.exampleTranslation is string && data.exampleTranslation.size() <= 2000)) &&
+             (!('notes' in data) || (data.notes is string && data.notes.size() <= 3000)) &&
+             (!('memo' in data) || (data.memo is string && data.memo.size() <= 3000)) &&
+             // Array size constraint
+             (!('tags' in data) || (data.tags is list && data.tags.size() <= 20)) &&
+             // Boolean flags
+             (!('isMemorized' in data) || data.isMemorized is bool) &&
+             (!('memorized' in data) || data.memorized is bool) &&
+             // Difficulty / level rating constraints
+             (!('difficulty' in data) || (data.difficulty is int && data.difficulty >= 1 && data.difficulty <= 5) || (data.difficulty is string && data.difficulty.size() <= 20)) &&
+             (!('level' in data) || (data.level is int && data.level >= 1 && data.level <= 10) || (data.level is string && data.level.size() <= 20)) &&
+             // Spaced repetition & study progress metrics
+             (!('reviewCount' in data) || (data.reviewCount is int && data.reviewCount >= 0)) &&
+             (!('memoryStage' in data) || (data.memoryStage is int && data.memoryStage >= 0 && data.memoryStage <= 20)) &&
+             // Timestamps
+             (!('lastReviewedAt' in data) || data.lastReviewedAt is timestamp) &&
+             (!('nextReviewDate' in data) || data.nextReviewDate is timestamp) &&
+             (!('createdAt' in data) || data.createdAt is timestamp) &&
+             (!('updatedAt' in data) || data.updatedAt is timestamp) &&
+             // Owner identity integrity (if field is provided)
+             (!('userId' in data) || (data.userId is string && data.userId == userId));
+    }
+
+    // Immutable field protection for vocabulary items
+    function areImmutableWordFieldsUnchanged() {
+      return areImmutableFieldsUnchanged(['createdAt', 'userId']);
+    }
+
+    // Generic payload boundary check for any auxiliary subcollections
+    function isValidAuxiliaryDoc(data, userId) {
+      return data.keys().size() <= 30 &&
+             (!('userId' in data) || (data.userId is string && data.userId == userId)) &&
+             (!('uid' in data) || (data.uid is string && data.uid == userId)) &&
+             (!('createdAt' in data) || data.createdAt is timestamp) &&
+             (!('updatedAt' in data) || data.updatedAt is timestamp);
+    }
+
+    // -------------------------------------------------------------
+    // Security Rules Definitions
+    // -------------------------------------------------------------
+
+    // Default Deny: All access closed by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // User profile and subcollections tree
+    match /users/{userId} {
+      // User profile document: only the authenticated owner can access
+      allow read, delete: if isOwner(userId);
+      allow create: if isOwner(userId) && isValidUser(request.resource.data, userId);
+      allow update: if isOwner(userId) && isValidUser(request.resource.data, userId) && areImmutableUserFieldsUnchanged();
+
+      // Words subcollection: 'users/{userId}/words/{wordId}'
+      match /words/{wordId} {
+        allow read, delete: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidWord(request.resource.data, userId);
+        allow update: if isOwner(userId) && isValidWord(request.resource.data, userId) && areImmutableWordFieldsUnchanged();
+
+        // Deep subcollections under words (e.g. review history or study logs)
+        match /{subcollection}/{subDocId} {
+          allow read, delete: if isOwner(userId);
+          allow create, update: if isOwner(userId) && isValidAuxiliaryDoc(request.resource.data, userId);
+        }
+      }
+
+      // Any other direct subcollections under users/{userId} (e.g. categories, studySessions, folders)
+      // Excludes 'words' to prevent bypassing the strict isValidWord validator
+      match /{subcollection}/{docId} {
+        allow read, delete: if isOwner(userId) && subcollection != 'words';
+        allow create, update: if isOwner(userId) && subcollection != 'words' && isValidAuxiliaryDoc(request.resource.data, userId);
+      }
+    }
+  }
+}
